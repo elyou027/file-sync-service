@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -200,7 +201,7 @@ func (fs *FileSync) addWatchRecursive(root string) error {
 // processEvents processes filesystem events
 func (fs *FileSync) processEvents() {
 	debounce := make(map[string]*time.Timer)
-	recentCreates := make(map[string]time.Time) // Track recent CREATE events
+	newFiles := make(map[string]bool) // Track truly new files
 
 	for {
 		select {
@@ -218,28 +219,17 @@ func (fs *FileSync) processEvents() {
 
 			log.Printf("File event: %s %s", event.Op, event.Name)
 
-			// Track CREATE events
+			// Track new files on CREATE
 			if event.Op&fsnotify.Create == fsnotify.Create {
-				recentCreates[event.Name] = time.Now()
-			}
-
-			// For WRITE events, check if there was a recent CREATE
-			if event.Op&fsnotify.Write == fsnotify.Write {
-				if createTime, exists := recentCreates[event.Name]; exists {
-					if time.Since(createTime) < 1*time.Second {
-						log.Printf("Ignoring WRITE event for recently created file: %s", event.Name)
-						continue
-					}
-					delete(recentCreates, event.Name)
+				if fileInfo, err := os.Stat(event.Name); err == nil && !fileInfo.IsDir() {
+					newFiles[event.Name] = true
+					log.Printf("Marking as new file: %s", event.Name)
 				}
 			}
 
-			// Clean up old CREATE tracking
-			cutoff := time.Now().Add(-5 * time.Second)
-			for path, createTime := range recentCreates {
-				if createTime.Before(cutoff) {
-					delete(recentCreates, path)
-				}
+			// Clean up tracking for removed files
+			if event.Op&fsnotify.Remove == fsnotify.Remove {
+				delete(newFiles, event.Name)
 			}
 
 			// Debounce rapid successive events on the same file
@@ -247,9 +237,10 @@ func (fs *FileSync) processEvents() {
 				timer.Stop()
 			}
 
-			debounce[event.Name] = time.AfterFunc(500*time.Millisecond, func() {
-				fs.handleFileEvent(event)
+			debounce[event.Name] = time.AfterFunc(1*time.Second, func() { // Increased to 1 second
+				fs.handleFileEventWithCheck(event, newFiles[event.Name])
 				delete(debounce, event.Name)
+				delete(newFiles, event.Name) // Clean up after processing
 			})
 
 		case err, ok := <-fs.watcher.Errors:
@@ -257,6 +248,83 @@ func (fs *FileSync) processEvents() {
 				return
 			}
 			log.Printf("Watcher error: %v", err)
+		}
+	}
+}
+
+// handleFileEventWithCheck handles file events with new file detection
+func (fs *FileSync) handleFileEventWithCheck(event fsnotify.Event, isNewFile bool) {
+	relPath, err := filepath.Rel(fs.config.WatchPath, event.Name)
+	if err != nil {
+		log.Printf("Error getting relative path for %s: %v", event.Name, err)
+		return
+	}
+
+	s3Key := filepath.Join(fs.config.S3Prefix, relPath)
+	s3Key = strings.ReplaceAll(s3Key, "\\", "/")
+
+	switch {
+	case event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write:
+		// Handle file creation or modification
+		fileInfo, err := os.Stat(event.Name)
+		if err != nil {
+			log.Printf("Error getting file info for %s: %v", event.Name, err)
+			return
+		}
+
+		if fileInfo.IsDir() {
+			// Add watch to new directory
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				if err := fs.watcher.Add(event.Name); err != nil {
+					log.Printf("Error adding watch to new directory %s: %v", event.Name, err)
+				} else {
+					log.Printf("Added watch for new directory: %s", event.Name)
+				}
+			}
+			return
+		}
+
+		// Check if file has content (avoid 0-byte uploads)
+		if fileInfo.Size() == 0 {
+			log.Printf("Skipping upload of empty file: %s", event.Name)
+			return
+		}
+
+		// Upload file to S3
+		if err := fs.uploadFile(event.Name, s3Key); err != nil {
+			log.Printf("Failed to upload %s: %v", event.Name, err)
+			fs.addToRetryQueue("upload", event.Name, s3Key)
+		} else {
+			if isNewFile {
+				log.Printf("Successfully uploaded new file: %s -> s3://%s/%s", event.Name, fs.config.S3Bucket, s3Key)
+				// NO INVALIDATION for new files
+			} else {
+				log.Printf("Successfully updated existing file: %s -> s3://%s/%s", event.Name, fs.config.S3Bucket, s3Key)
+				// Add invalidation for existing files
+				fs.addToInvalidationBatch("/" + s3Key)
+			}
+		}
+
+	case event.Op&fsnotify.Remove == fsnotify.Remove:
+		// Handle file deletion
+		if err := fs.deleteFromS3(s3Key); err != nil {
+			log.Printf("Failed to delete from S3 %s: %v", s3Key, err)
+			fs.addToRetryQueue("delete", event.Name, s3Key)
+		} else {
+			log.Printf("Successfully deleted from S3: s3://%s/%s", fs.config.S3Bucket, s3Key)
+			// Add invalidation for deleted files
+			fs.addToInvalidationBatch("/" + s3Key)
+		}
+
+	case event.Op&fsnotify.Rename == fsnotify.Rename:
+		// Handle rename as delete
+		if err := fs.deleteFromS3(s3Key); err != nil {
+			log.Printf("Failed to delete renamed file from S3 %s: %v", s3Key, err)
+			fs.addToRetryQueue("delete", event.Name, s3Key)
+		} else {
+			log.Printf("Successfully deleted renamed file from S3: s3://%s/%s", fs.config.S3Bucket, s3Key)
+			// Add invalidation for renamed files
+			fs.addToInvalidationBatch("/" + s3Key)
 		}
 	}
 }
@@ -291,28 +359,17 @@ func (fs *FileSync) handleFileEvent(event fsnotify.Event) {
 			return
 		}
 
-		// Mark file as recently created
-		fs.recentlyCreated[event.Name] = time.Now()
-
-		// Clean up old entries (older than 5 seconds)
-		cutoff := time.Now().Add(-5 * time.Second)
-		for path, createTime := range fs.recentlyCreated {
-			if createTime.Before(cutoff) {
-				delete(fs.recentlyCreated, path)
-			}
-		}
-
 		// Upload new file to S3
 		if err := fs.uploadFile(event.Name, s3Key); err != nil {
 			log.Printf("Failed to upload %s: %v", event.Name, err)
 			fs.addToRetryQueue("upload", event.Name, s3Key)
 		} else {
-			log.Printf("Successfully uploaded: %s -> s3://%s/%s", event.Name, fs.config.S3Bucket, s3Key)
+			log.Printf("Successfully uploaded NEW file: %s -> s3://%s/%s", event.Name, fs.config.S3Bucket, s3Key)
 			// DO NOT add invalidation for new files - they are not cached yet
 		}
 
 	case event.Op&fsnotify.Write == fsnotify.Write:
-		// Handle file modification
+		// Handle file modification (EXISTING FILES - invalidation required)
 		fileInfo, err := os.Stat(event.Name)
 		if err != nil {
 			log.Printf("Error getting file info for %s: %v", event.Name, err)
@@ -323,39 +380,17 @@ func (fs *FileSync) handleFileEvent(event fsnotify.Event) {
 			return // Ignore directory modifications
 		}
 
-		// Check if this is a recently created file
-		if createTime, exists := fs.recentlyCreated[event.Name]; exists {
-			// If file was created within the last 2 seconds, treat as new file
-			if time.Since(createTime) < 2*time.Second {
-				log.Printf("Skipping invalidation for recently created file: %s", event.Name)
-
-				// Upload the file (in case CREATE didn't complete the upload)
-				if err := fs.uploadFile(event.Name, s3Key); err != nil {
-					log.Printf("Failed to upload recently created file %s: %v", event.Name, err)
-					fs.addToRetryQueue("upload", event.Name, s3Key)
-				} else {
-					log.Printf("Successfully uploaded recently created file: %s -> s3://%s/%s", event.Name, fs.config.S3Bucket, s3Key)
-				}
-				return
-			}
-			// Remove from recently created if it's older
-			delete(fs.recentlyCreated, event.Name)
-		}
-
-		// This is a modification of an existing file - needs invalidation
+		// Upload modified file to S3
 		if err := fs.uploadFile(event.Name, s3Key); err != nil {
 			log.Printf("Failed to upload modified file %s: %v", event.Name, err)
-			fs.addToRetryQueue("upload", event.Name, s3Key)
+			fs.addToRetryQueue("upload_with_invalidation", event.Name, s3Key) // Special retry type
 		} else {
-			log.Printf("Successfully updated: %s -> s3://%s/%s", event.Name, fs.config.S3Bucket, s3Key)
+			log.Printf("Successfully updated EXISTING file: %s -> s3://%s/%s", event.Name, fs.config.S3Bucket, s3Key)
 			// Add invalidation for modified files
 			fs.addToInvalidationBatch("/" + s3Key)
 		}
 
 	case event.Op&fsnotify.Remove == fsnotify.Remove:
-		// Remove from recently created if it exists
-		delete(fs.recentlyCreated, event.Name)
-
 		// Handle file deletion (invalidation required)
 		if err := fs.deleteFromS3(s3Key); err != nil {
 			log.Printf("Failed to delete from S3 %s: %v", s3Key, err)
@@ -367,9 +402,6 @@ func (fs *FileSync) handleFileEvent(event fsnotify.Event) {
 		}
 
 	case event.Op&fsnotify.Rename == fsnotify.Rename:
-		// Remove from recently created if it exists
-		delete(fs.recentlyCreated, event.Name)
-
 		// Handle rename as delete (we'll get a create event for the new name)
 		if err := fs.deleteFromS3(s3Key); err != nil {
 			log.Printf("Failed to delete renamed file from S3 %s: %v", s3Key, err)
@@ -382,20 +414,175 @@ func (fs *FileSync) handleFileEvent(event fsnotify.Event) {
 	}
 }
 
-// uploadFile uploads a file to S3
+// uploadFile uploads a file to S3 with correct MIME type detection
 func (fs *FileSync) uploadFile(filePath, s3Key string) error {
+	// Wait for file to be fully written (check file size stability)
+	var lastSize int64 = -1
+	for i := 0; i < 10; i++ { // Maximum 10 attempts
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			return err
+		}
+
+		currentSize := fileInfo.Size()
+
+		// If file size is 0, wait longer
+		if currentSize == 0 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// If file size hasn't changed for 2 consecutive checks, assume it's ready
+		if currentSize == lastSize {
+			break
+		}
+
+		lastSize = currentSize
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Final check - ensure file is not empty
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+
+	if fileInfo.Size() == 0 {
+		return fmt.Errorf("file is empty or still being written: %s", filePath)
+	}
+
+	// Open file for reading
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
+	// Detect MIME type by reading first 512 bytes
+	buffer := make([]byte, 512)
+	n, err := file.Read(buffer)
+	if err != nil && err.Error() != "EOF" {
+		return err
+	}
+
+	// Reset file pointer to beginning
+	file.Seek(0, 0)
+
+	// Detect MIME type
+	contentType := fs.detectContentType(buffer[:n], filePath)
+
+	log.Printf("Uploading file %s (size: %d bytes, type: %s) to S3", filePath, fileInfo.Size(), contentType)
+
 	_, err = fs.s3Client.PutObject(fs.ctx, &s3.PutObjectInput{
-		Bucket: aws.String(fs.config.S3Bucket),
-		Key:    aws.String(s3Key),
+		Bucket:      aws.String(fs.config.S3Bucket),
+		Key:         aws.String(s3Key),
+		Body:        file,
+		ContentType: aws.String(contentType),
 	})
 
 	return err
+}
+
+// detectContentType detects MIME type based on file content and extension
+func (fs *FileSync) detectContentType(data []byte, filename string) string {
+	// First try to detect by file content
+	contentType := http.DetectContentType(data)
+
+	// If generic type detected, try to determine by file extension
+	if contentType == "application/octet-stream" || contentType == "text/plain; charset=utf-8" {
+		ext := strings.ToLower(filepath.Ext(filename))
+
+		switch ext {
+		// Images
+		case ".jpg", ".jpeg":
+			return "image/jpeg"
+		case ".png":
+			return "image/png"
+		case ".gif":
+			return "image/gif"
+		case ".webp":
+			return "image/webp"
+		case ".svg":
+			return "image/svg+xml"
+		case ".bmp":
+			return "image/bmp"
+		case ".ico":
+			return "image/x-icon"
+		case ".tiff", ".tif":
+			return "image/tiff"
+
+		// Documents
+		case ".pdf":
+			return "application/pdf"
+		case ".doc":
+			return "application/msword"
+		case ".docx":
+			return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case ".xls":
+			return "application/vnd.ms-excel"
+		case ".xlsx":
+			return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case ".ppt":
+			return "application/vnd.ms-powerpoint"
+		case ".pptx":
+			return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+		// Text files
+		case ".txt":
+			return "text/plain"
+		case ".html", ".htm":
+			return "text/html"
+		case ".css":
+			return "text/css"
+		case ".js":
+			return "application/javascript"
+		case ".json":
+			return "application/json"
+		case ".xml":
+			return "application/xml"
+		case ".csv":
+			return "text/csv"
+
+		// Video
+		case ".mp4":
+			return "video/mp4"
+		case ".avi":
+			return "video/x-msvideo"
+		case ".mov":
+			return "video/quicktime"
+		case ".wmv":
+			return "video/x-ms-wmv"
+		case ".webm":
+			return "video/webm"
+
+		// Audio
+		case ".mp3":
+			return "audio/mpeg"
+		case ".wav":
+			return "audio/wav"
+		case ".ogg":
+			return "audio/ogg"
+		case ".m4a":
+			return "audio/mp4"
+
+		// Archives
+		case ".zip":
+			return "application/zip"
+		case ".rar":
+			return "application/vnd.rar"
+		case ".tar":
+			return "application/x-tar"
+		case ".gz":
+			return "application/gzip"
+		case ".7z":
+			return "application/x-7z-compressed"
+
+		default:
+			return "application/octet-stream"
+		}
+	}
+
+	return contentType
 }
 
 // deleteFromS3 deletes an object from S3
@@ -550,7 +737,6 @@ func (fs *FileSync) processRetryQueue() {
 
 	for _, operation := range fs.retryQueue {
 		var err error
-		var needsInvalidation bool
 
 		switch operation.Type {
 		case "upload":
@@ -558,12 +744,25 @@ func (fs *FileSync) processRetryQueue() {
 			if _, statErr := os.Stat(operation.FilePath); statErr == nil {
 				err = fs.uploadFile(operation.FilePath, operation.S3Key)
 				if err == nil {
-					log.Printf("Successfully uploaded (retry): %s -> s3://%s/%s",
+					log.Printf("Successfully uploaded NEW file (retry): %s -> s3://%s/%s",
 						operation.FilePath, fs.config.S3Bucket, operation.S3Key)
+					// NO invalidation for new file retries
+				}
+			} else {
+				// File no longer exists, remove from queue
+				log.Printf("File no longer exists, removing from retry queue: %s", operation.FilePath)
+				continue
+			}
 
-					// For retry operations, assume this is an update (not a new file)
-					// since new files rarely fail on first attempt
-					needsInvalidation = true
+		case "upload_with_invalidation":
+			// Check if file still exists before trying to upload
+			if _, statErr := os.Stat(operation.FilePath); statErr == nil {
+				err = fs.uploadFile(operation.FilePath, operation.S3Key)
+				if err == nil {
+					log.Printf("Successfully uploaded EXISTING file (retry): %s -> s3://%s/%s",
+						operation.FilePath, fs.config.S3Bucket, operation.S3Key)
+					// Add invalidation for existing file retries
+					fs.addToInvalidationBatch("/" + operation.S3Key)
 				}
 			} else {
 				// File no longer exists, remove from queue
@@ -575,7 +774,8 @@ func (fs *FileSync) processRetryQueue() {
 			err = fs.deleteFromS3(operation.S3Key)
 			if err == nil {
 				log.Printf("Successfully deleted (retry): s3://%s/%s", fs.config.S3Bucket, operation.S3Key)
-				needsInvalidation = true
+				// Add invalidation for deleted files
+				fs.addToInvalidationBatch("/" + operation.S3Key)
 			}
 
 		case "invalidate":
@@ -588,9 +788,6 @@ func (fs *FileSync) processRetryQueue() {
 		if err != nil {
 			log.Printf("Retry failed for %s %s: %v", operation.Type, operation.FilePath, err)
 			remaining = append(remaining, operation)
-		} else if needsInvalidation {
-			// Add invalidation only for operations that require cache clearing
-			fs.addToInvalidationBatch("/" + operation.S3Key)
 		}
 	}
 
