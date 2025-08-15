@@ -1,0 +1,32 @@
+
+# File Synchronization Service Configuration
+# This configuration file defines the settings for the file sync service
+
+# Directory to watch for file changes (absolute path recommended)
+watch_path: "/path/to/watch/directory"
+
+# AWS S3 bucket name where files will be synchronized
+s3_bucket: "your-s3-bucket-name"
+
+# AWS region where your S3 bucket is located
+s3_region: "us-east-1"
+
+# Optional: S3 key prefix to prepend to all uploaded files
+# If empty, files will be uploaded directly to bucket root
+s3_prefix: "synced-files"
+
+# File path where retry queue will be stored (relative or absolute)
+# This file stores failed operations for retry later
+retry_file: "retry_queue.json"
+
+# Retry interval in seconds (how often to retry failed operations)
+# Default: 300 seconds (5 minutes)
+retry_interval_seconds: 300
+
+# CloudFront Configuration
+# Enable CloudFront cache invalidation
+cloudfront_enabled: true
+
+# CloudFront Distribution ID (required if cloudfront_enabled is true)
+# You can find this in AWS Console -> CloudFront -> Distributions
+cloudfront_distribution_id: "E1234567890ABC"
