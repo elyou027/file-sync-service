@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,16 +32,18 @@ type Config struct {
 	S3Prefix               string `yaml:"s3_prefix"`
 	RetryFile              string `yaml:"retry_file"`
 	RetryInterval          int    `yaml:"retry_interval_seconds"`
+	MaxRetryAttempts       int    `yaml:"max_retry_attempts"`
 	CloudFrontDistribution string `yaml:"cloudfront_distribution_id"`
 	CloudFrontEnabled      bool   `yaml:"cloudfront_enabled"`
 }
 
 // RetryOperation represents a pending file operation
 type RetryOperation struct {
-	Type      string    `json:"type"` // "upload", "delete", or "invalidate"
-	FilePath  string    `json:"file_path"`
-	S3Key     string    `json:"s3_key"`
-	Timestamp time.Time `json:"timestamp"`
+	Type         string    `json:"type"` // "upload", "delete", or "invalidate"
+	FilePath     string    `json:"file_path"`
+	S3Key        string    `json:"s3_key"`
+	Timestamp    time.Time `json:"timestamp"`
+	AttemptCount int       `json:"attempt_count"`
 }
 
 // InvalidationBatch holds multiple paths for batch invalidation
@@ -133,6 +136,9 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 	if cfg.RetryInterval == 0 {
 		cfg.RetryInterval = 300 // 5 minutes
+	}
+	if cfg.MaxRetryAttempts == 0 {
+		cfg.MaxRetryAttempts = 5 // Default 5 attempts
 	}
 
 	return &cfg, nil
@@ -451,7 +457,7 @@ func (fs *FileSync) uploadFile(filePath, s3Key string) error {
 		return fmt.Errorf("file is empty or still being written: %s", filePath)
 	}
 
-	// Open file for reading
+	// Open a file for reading
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -485,7 +491,7 @@ func (fs *FileSync) uploadFile(filePath, s3Key string) error {
 
 // detectContentType detects MIME type based on file content and extension
 func (fs *FileSync) detectContentType(data []byte, filename string) string {
-	// First try to detect by file content
+	// First, try to detect by file content
 	contentType := http.DetectContentType(data)
 
 	// If generic type detected, try to determine by file extension
@@ -595,14 +601,39 @@ func (fs *FileSync) deleteFromS3(s3Key string) error {
 	return err
 }
 
+// encodePathForCloudFront properly URL-encodes path for CloudFront invalidation
+func (fs *FileSync) encodePathForCloudFront(path string) string {
+	// Ensure path starts with /
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	// Parse and encode the URL path
+	parsedURL, err := url.Parse(path)
+	if err != nil {
+		// If parsing fails, manually encode spaces and common problematic characters
+		encoded := strings.ReplaceAll(path, " ", "%20")
+		encoded = strings.ReplaceAll(encoded, "+", "%2B")
+		encoded = strings.ReplaceAll(encoded, "&", "%26")
+		encoded = strings.ReplaceAll(encoded, "#", "%23")
+		encoded = strings.ReplaceAll(encoded, "?", "%3F")
+		return encoded
+	}
+
+	return parsedURL.EscapedPath()
+}
+
 // addToInvalidationBatch adds a path to the invalidation batch
 func (fs *FileSync) addToInvalidationBatch(path string) {
 	if !fs.config.CloudFrontEnabled {
 		return
 	}
 
-	fs.invalidationBatch.paths = append(fs.invalidationBatch.paths, path)
-	log.Printf("Added to invalidation batch: %s", path)
+	// Properly encode the path for CloudFront
+	encodedPath := fs.encodePathForCloudFront(path)
+
+	fs.invalidationBatch.paths = append(fs.invalidationBatch.paths, encodedPath)
+	log.Printf("Added to invalidation batch: %s (encoded: %s)", path, encodedPath)
 }
 
 // invalidationBatchProcessor processes invalidation batches every 30 seconds
@@ -652,16 +683,24 @@ func (fs *FileSync) createInvalidation(paths []string) error {
 		return nil
 	}
 
+	// Encode all paths properly
+	var encodedPaths []string
+	for _, path := range paths {
+		encoded := fs.encodePathForCloudFront(path)
+		encodedPaths = append(encodedPaths, encoded)
+		log.Printf("Invalidating path: %s -> %s", path, encoded)
+	}
+
 	// CloudFront has a limit of 3000 paths per invalidation
 	const maxPathsPerInvalidation = 3000
 
-	for i := 0; i < len(paths); i += maxPathsPerInvalidation {
+	for i := 0; i < len(encodedPaths); i += maxPathsPerInvalidation {
 		end := i + maxPathsPerInvalidation
-		if end > len(paths) {
-			end = len(paths)
+		if end > len(encodedPaths) {
+			end = len(encodedPaths)
 		}
 
-		batch := paths[i:end]
+		batch := encodedPaths[i:end]
 		callerReference := fmt.Sprintf("file-sync-%d", time.Now().UnixNano())
 
 		input := &cloudfront.CreateInvalidationInput{
@@ -700,10 +739,11 @@ func (fs *FileSync) isTemporaryFile(filename string) bool {
 // addToRetryQueue adds a failed operation to the retry queue
 func (fs *FileSync) addToRetryQueue(opType, filePath, s3Key string) {
 	operation := RetryOperation{
-		Type:      opType,
-		FilePath:  filePath,
-		S3Key:     s3Key,
-		Timestamp: time.Now(),
+		Type:         opType,
+		FilePath:     filePath,
+		S3Key:        s3Key,
+		Timestamp:    time.Now(),
+		AttemptCount: 1,
 	}
 
 	fs.retryQueue = append(fs.retryQueue, operation)
@@ -736,22 +776,30 @@ func (fs *FileSync) processRetryQueue() {
 	var remaining []RetryOperation
 
 	for _, operation := range fs.retryQueue {
+		// Check if max attempts reached
+		if operation.AttemptCount > fs.config.MaxRetryAttempts {
+			log.Printf("Max retry attempts (%d) exceeded for operation %s on %s, removing from queue",
+				fs.config.MaxRetryAttempts, operation.Type, operation.FilePath)
+			continue
+		}
+
 		var err error
+		success := false
 
 		switch operation.Type {
 		case "upload":
-			// Check if file still exists before trying to upload
+			// Check if a file still exists before trying to upload
 			if _, statErr := os.Stat(operation.FilePath); statErr == nil {
 				err = fs.uploadFile(operation.FilePath, operation.S3Key)
 				if err == nil {
-					log.Printf("Successfully uploaded NEW file (retry): %s -> s3://%s/%s",
-						operation.FilePath, fs.config.S3Bucket, operation.S3Key)
-					// NO invalidation for new file retries
+					log.Printf("Successfully uploaded file (retry %d): %s -> s3://%s/%s",
+						operation.AttemptCount, operation.FilePath, fs.config.S3Bucket, operation.S3Key)
+					success = true
 				}
 			} else {
 				// File no longer exists, remove from queue
 				log.Printf("File no longer exists, removing from retry queue: %s", operation.FilePath)
-				continue
+				success = true // Don't retry
 			}
 
 		case "upload_with_invalidation":
@@ -759,49 +807,66 @@ func (fs *FileSync) processRetryQueue() {
 			if _, statErr := os.Stat(operation.FilePath); statErr == nil {
 				err = fs.uploadFile(operation.FilePath, operation.S3Key)
 				if err == nil {
-					log.Printf("Successfully uploaded EXISTING file (retry): %s -> s3://%s/%s",
-						operation.FilePath, fs.config.S3Bucket, operation.S3Key)
-					// Add invalidation for existing file retries
+					log.Printf("Successfully uploaded file (retry %d): %s -> s3://%s/%s",
+						operation.AttemptCount, operation.FilePath, fs.config.S3Bucket, operation.S3Key)
+					// Add invalidation for modified files
 					fs.addToInvalidationBatch("/" + operation.S3Key)
+					success = true
 				}
 			} else {
 				// File no longer exists, remove from queue
 				log.Printf("File no longer exists, removing from retry queue: %s", operation.FilePath)
-				continue
+				success = true // Don't retry
 			}
 
 		case "delete":
 			err = fs.deleteFromS3(operation.S3Key)
 			if err == nil {
-				log.Printf("Successfully deleted (retry): s3://%s/%s", fs.config.S3Bucket, operation.S3Key)
-				// Add invalidation for deleted files
-				fs.addToInvalidationBatch("/" + operation.S3Key)
+				log.Printf("Successfully deleted from S3 (retry %d): s3://%s/%s",
+					operation.AttemptCount, fs.config.S3Bucket, operation.S3Key)
+				success = true
 			}
 
 		case "invalidate":
-			err = fs.createInvalidation([]string{operation.FilePath})
+			paths := []string{"/" + operation.S3Key}
+			err = fs.createInvalidation(paths)
 			if err == nil {
-				log.Printf("Successfully invalidated (retry): %s", operation.FilePath)
+				log.Printf("Successfully created CloudFront invalidation (retry %d): %s",
+					operation.AttemptCount, operation.S3Key)
+				success = true
 			}
 		}
 
-		if err != nil {
-			log.Printf("Retry failed for %s %s: %v", operation.Type, operation.FilePath, err)
+		if !success && err != nil {
+			log.Printf("Retry %d failed for %s %s: %v",
+				operation.AttemptCount, operation.Type, operation.FilePath, err)
+
+			// Increment attempt count and add back to the queue
+			operation.AttemptCount++
+			operation.Timestamp = time.Now()
 			remaining = append(remaining, operation)
 		}
 	}
 
+	// Update retry queue with remaining operations
 	fs.retryQueue = remaining
 	fs.saveRetryQueue()
+
+	if len(remaining) > 0 {
+		log.Printf("Retry queue now contains %d items", len(remaining))
+	} else {
+		log.Printf("Retry queue is now empty")
+	}
 }
 
-// loadRetryQueue loads the retry queue from file
+// loadRetryQueue loads the retry queue from a file
 func (fs *FileSync) loadRetryQueue() error {
+	if _, err := os.Stat(fs.config.RetryFile); os.IsNotExist(err) {
+		return nil // No retry file exists yet
+	}
+
 	data, err := os.ReadFile(fs.config.RetryFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // File doesn't exist, start with empty queue
-		}
 		return err
 	}
 
@@ -809,16 +874,19 @@ func (fs *FileSync) loadRetryQueue() error {
 }
 
 // saveRetryQueue saves the retry queue to file
-func (fs *FileSync) saveRetryQueue() {
-	data, err := json.MarshalIndent(fs.retryQueue, "", "  ")
-	if err != nil {
-		log.Printf("Error marshaling retry queue: %v", err)
-		return
+func (fs *FileSync) saveRetryQueue() error {
+	if len(fs.retryQueue) == 0 {
+		// Remove retry file if queue is empty
+		os.Remove(fs.config.RetryFile)
+		return nil
 	}
 
-	if err := os.WriteFile(fs.config.RetryFile, data, 0644); err != nil {
-		log.Printf("Error saving retry queue: %v", err)
+	data, err := json.MarshalIndent(fs.retryQueue, "", "  ")
+	if err != nil {
+		return err
 	}
+
+	return os.WriteFile(fs.config.RetryFile, data, 0644)
 }
 
 func main() {
