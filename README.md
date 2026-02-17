@@ -69,6 +69,14 @@ cloudfront_enabled: true
 
 # CloudFront Distribution ID (required if cloudfront_enabled is true)
 cloudfront_distribution_id: "E1234567890ABC"
+
+# Optimization for CloudFront Invalidation (optional)
+# How often to send invalidation requests (seconds, default: 60)
+invalidation_interval_seconds: 300
+
+# Threshold for using wildcard (*) invalidation (default: 10)
+# If more than N files in the same directory change, the whole directory is invalidated
+wildcard_threshold: 5
 ```
 
 ### Configuration Parameters

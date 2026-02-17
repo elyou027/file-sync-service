@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +36,8 @@ type Config struct {
 	MaxRetryAttempts       int    `yaml:"max_retry_attempts"`
 	CloudFrontDistribution string `yaml:"cloudfront_distribution_id"`
 	CloudFrontEnabled      bool   `yaml:"cloudfront_enabled"`
+	InvalidationInterval   int    `yaml:"invalidation_interval_seconds"`
+	WildcardThreshold      int    `yaml:"wildcard_threshold"`
 }
 
 // RetryOperation represents a pending file operation
@@ -139,6 +142,12 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 	if cfg.MaxRetryAttempts == 0 {
 		cfg.MaxRetryAttempts = 5 // Default 5 attempts
+	}
+	if cfg.InvalidationInterval == 0 {
+		cfg.InvalidationInterval = 60 // 60 seconds
+	}
+	if cfg.WildcardThreshold == 0 {
+		cfg.WildcardThreshold = 10 // 10 files in one directory
 	}
 
 	return &cfg, nil
@@ -636,9 +645,13 @@ func (fs *FileSync) addToInvalidationBatch(path string) {
 	log.Printf("Added to invalidation batch: %s (encoded: %s)", path, encodedPath)
 }
 
-// invalidationBatchProcessor processes invalidation batches every 30 seconds
+// invalidationBatchProcessor processes invalidation batches based on configured interval
 func (fs *FileSync) invalidationBatchProcessor() {
-	ticker := time.NewTicker(30 * time.Second)
+	interval := fs.config.InvalidationInterval
+	if interval < 10 {
+		interval = 10 // Minimum 10 seconds
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -659,22 +672,133 @@ func (fs *FileSync) processInvalidationBatch() {
 		return
 	}
 
-	paths := make([]string, len(fs.invalidationBatch.paths))
-	copy(paths, fs.invalidationBatch.paths)
+	rawPaths := make([]string, len(fs.invalidationBatch.paths))
+	copy(rawPaths, fs.invalidationBatch.paths)
 
 	// Clear the batch
 	fs.invalidationBatch.paths = fs.invalidationBatch.paths[:0]
 	fs.invalidationBatch.timestamp = time.Now()
 
-	if err := fs.createInvalidation(paths); err != nil {
+	// Optimize paths by using wildcards where appropriate
+	optimizedPaths := fs.optimizeInvalidationPaths(rawPaths)
+
+	if err := fs.createInvalidation(optimizedPaths); err != nil {
 		log.Printf("Failed to create CloudFront invalidation: %v", err)
-		// Add to retry queue
-		for _, path := range paths {
+		// Add to retry queue (using original paths to be safe, or we could use optimized)
+		for _, path := range optimizedPaths {
 			fs.addToRetryQueue("invalidate", path, strings.TrimPrefix(path, "/"))
 		}
 	} else {
-		log.Printf("Successfully created CloudFront invalidation for %d paths", len(paths))
+		log.Printf("Successfully created CloudFront invalidation for %d original paths (optimized to %d items)",
+			len(rawPaths), len(optimizedPaths))
 	}
+}
+
+// optimizeInvalidationPaths groups paths by directory and uses wildcard if threshold exceeded.
+// It performs hierarchical grouping to find common prefixes.
+func (fs *FileSync) optimizeInvalidationPaths(paths []string) []string {
+	threshold := fs.config.WildcardThreshold
+	if threshold <= 0 {
+		return paths
+	}
+
+	// Remove duplicates
+	uniquePathsMap := make(map[string]bool)
+	for _, p := range paths {
+		uniquePathsMap[p] = true
+	}
+
+	uniquePaths := make([]string, 0, len(uniquePathsMap))
+	for p := range uniquePathsMap {
+		uniquePaths = append(uniquePaths, p)
+	}
+
+	if len(uniquePaths) < threshold {
+		return uniquePaths
+	}
+
+	type dirInfo struct {
+		files []string
+	}
+
+	dirStats := make(map[string]*dirInfo)
+
+	for _, p := range uniquePaths {
+		curr := p
+		for {
+			curr = filepath.Dir(curr)
+			if curr == "." || curr == "/" {
+				// Avoid global root wildcard unless absolutely necessary, but track it
+				d := "/"
+				if dirStats[d] == nil {
+					dirStats[d] = &dirInfo{}
+				}
+				dirStats[d].files = append(dirStats[d].files, p)
+				break
+			}
+
+			d := curr
+			if !strings.HasPrefix(d, "/") {
+				d = "/" + d
+			}
+
+			if dirStats[d] == nil {
+				dirStats[d] = &dirInfo{}
+			}
+			dirStats[d].files = append(dirStats[d].files, p)
+		}
+	}
+
+	dirs := make([]string, 0, len(dirStats))
+	for d := range dirStats {
+		if d == "/" {
+			continue // Root wildcard is usually too broad
+		}
+		dirs = append(dirs, d)
+	}
+
+	// Sort directories by length (deepest first)
+	// This helps in finding the most specific wildcard that covers the threshold
+	// Actually, we want to find the most broad wildcard that covers the threshold to save most money.
+	// But if we go broad first, we might invalidate too much.
+	// Let's go from broad to deep to maximize savings as requested.
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i]) < len(dirs[j])
+	})
+
+	coveredFiles := make(map[string]bool)
+	var result []string
+
+	for _, d := range dirs {
+		countNotCovered := 0
+		for _, f := range dirStats[d].files {
+			if !coveredFiles[f] {
+				countNotCovered++
+			}
+		}
+
+		if countNotCovered >= threshold {
+			wildcardPath := d
+			if !strings.HasSuffix(wildcardPath, "/") {
+				wildcardPath += "/"
+			}
+			wildcardPath += "*"
+			result = append(result, wildcardPath)
+			for _, f := range dirStats[d].files {
+				coveredFiles[f] = true
+			}
+			log.Printf("Optimized %d paths in %s to wildcard %s", countNotCovered, d, wildcardPath)
+		}
+	}
+
+	// Add files that didn't get covered by any wildcard
+	for _, f := range uniquePaths {
+		if !coveredFiles[f] {
+			result = append(result, f)
+		}
+	}
+
+	return result
 }
 
 // createInvalidation creates a CloudFront invalidation
