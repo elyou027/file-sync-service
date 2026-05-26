@@ -30,3 +30,12 @@ cloudfront_enabled: true
 # CloudFront Distribution ID (required if cloudfront_enabled is true)
 # You can find this in AWS Console -> CloudFront -> Distributions
 cloudfront_distribution_id: "E1234567890ABC"
+
+# Directories to skip entirely (no inotify watch is added, contents are
+# not synced). Each entry is a filepath.Match glob applied to (a) the
+# directory basename and (b) the path relative to watch_path. Examples:
+#   - "*_files"            matches any "*_files" directory at any depth
+#   - "articles/_attic"    matches that exact subtree
+# Useful when watch_path contains huge static subtrees that would
+# otherwise exhaust fs.inotify.max_user_watches.
+exclude_dirs: []

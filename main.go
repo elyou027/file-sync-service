@@ -27,17 +27,18 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	WatchPath              string `yaml:"watch_path"`
-	S3Bucket               string `yaml:"s3_bucket"`
-	S3Region               string `yaml:"s3_region"`
-	S3Prefix               string `yaml:"s3_prefix"`
-	RetryFile              string `yaml:"retry_file"`
-	RetryInterval          int    `yaml:"retry_interval_seconds"`
-	MaxRetryAttempts       int    `yaml:"max_retry_attempts"`
-	CloudFrontDistribution string `yaml:"cloudfront_distribution_id"`
-	CloudFrontEnabled      bool   `yaml:"cloudfront_enabled"`
-	InvalidationInterval   int    `yaml:"invalidation_interval_seconds"`
-	WildcardThreshold      int    `yaml:"wildcard_threshold"`
+	WatchPath              string   `yaml:"watch_path"`
+	S3Bucket               string   `yaml:"s3_bucket"`
+	S3Region               string   `yaml:"s3_region"`
+	S3Prefix               string   `yaml:"s3_prefix"`
+	RetryFile              string   `yaml:"retry_file"`
+	RetryInterval          int      `yaml:"retry_interval_seconds"`
+	MaxRetryAttempts       int      `yaml:"max_retry_attempts"`
+	CloudFrontDistribution string   `yaml:"cloudfront_distribution_id"`
+	CloudFrontEnabled      bool     `yaml:"cloudfront_enabled"`
+	InvalidationInterval   int      `yaml:"invalidation_interval_seconds"`
+	WildcardThreshold      int      `yaml:"wildcard_threshold"`
+	ExcludeDirs            []string `yaml:"exclude_dirs"`
 }
 
 // RetryOperation represents a pending file operation
@@ -197,20 +198,58 @@ func (fs *FileSync) Stop() {
 	log.Printf("Service stopped")
 }
 
-// addWatchRecursive adds watches to directory and all subdirectories
+// addWatchRecursive adds watches to directory and all subdirectories,
+// skipping any directory that matches a pattern in config.ExcludeDirs.
 func (fs *FileSync) addWatchRecursive(root string) error {
-	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	watchCount := 0
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
-			if err := fs.watcher.Add(path); err != nil {
-				return err
-			}
-			log.Printf("Added watch for directory: %s", path)
+		if !d.IsDir() {
+			return nil
 		}
+		if path != root && fs.isExcludedDir(path) {
+			log.Printf("Skipping excluded directory: %s", path)
+			return filepath.SkipDir
+		}
+		if err := fs.watcher.Add(path); err != nil {
+			return err
+		}
+		watchCount++
+		log.Printf("Added watch for directory: %s", path)
 		return nil
 	})
+	log.Printf("Total directories watched: %d", watchCount)
+	return err
+}
+
+// isExcludedDir reports whether path matches any pattern in config.ExcludeDirs.
+// Patterns are matched (filepath.Match semantics) against both the directory
+// basename and the path relative to WatchPath, so callers can write either
+// "*_files" (matches that basename at any depth) or "articles/_attic"
+// (matches that exact subtree).
+func (fs *FileSync) isExcludedDir(path string) bool {
+	patterns := fs.config.ExcludeDirs
+	if len(patterns) == 0 {
+		return false
+	}
+	base := filepath.Base(path)
+	rel, err := filepath.Rel(fs.config.WatchPath, path)
+	if err != nil {
+		rel = ""
+	}
+	for _, pattern := range patterns {
+		if matched, _ := filepath.Match(pattern, base); matched {
+			return true
+		}
+		if rel != "" && rel != "." {
+			if matched, _ := filepath.Match(pattern, rel); matched {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // processEvents processes filesystem events
@@ -290,6 +329,10 @@ func (fs *FileSync) handleFileEventWithCheck(event fsnotify.Event, isNewFile boo
 		if fileInfo.IsDir() {
 			// Add watch to new directory
 			if event.Op&fsnotify.Create == fsnotify.Create {
+				if fs.isExcludedDir(event.Name) {
+					log.Printf("Skipping watch for excluded directory: %s", event.Name)
+					return
+				}
 				if err := fs.watcher.Add(event.Name); err != nil {
 					log.Printf("Error adding watch to new directory %s: %v", event.Name, err)
 				} else {
