@@ -271,6 +271,16 @@ func (fs *FileSync) processEvents() {
 				continue
 			}
 
+			// Pure CHMOD carries no create/write/remove semantics. Because every
+			// event resets the debounce timer and only the last one is processed,
+			// a trailing CHMOD (emitted by mv/cp and by CMS move+chmod uploads)
+			// would otherwise collapse the debounced event into a no-op and the
+			// file would never be uploaded. Skip standalone CHMOD events; a
+			// combined WRITE|CHMOD still passes through.
+			if event.Op == fsnotify.Chmod {
+				continue
+			}
+
 			log.Printf("File event: %s %s", event.Op, event.Name)
 
 			// Track new files on CREATE
