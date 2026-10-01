@@ -17,7 +17,7 @@ synchronizes changes to AWS S3 bucket. Designed to run on Linux.
 
 ## Prerequisites
 
-- Go 1.19 or later
+- Go 1.27.1 or later
 - AWS credentials configured (via environment variables, IAM role, or AWS credentials file)
 - S3 bucket with appropriate permissions
 - Linux system with ext4 filesystem
