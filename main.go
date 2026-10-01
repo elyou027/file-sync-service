@@ -252,6 +252,18 @@ func (fs *FileSync) isExcludedDir(path string) bool {
 	return false
 }
 
+// shouldProcess filters events before the debouncer: temporary files, and standalone
+// CHMOD. Pure CHMOD carries no create/write/remove semantics. Because every event resets
+// the debounce timer and only the last one is processed, a trailing CHMOD (emitted by
+// mv/cp and by CMS move+chmod uploads) would otherwise collapse the debounced event into
+// a no-op and the file would never be uploaded. A combined WRITE|CHMOD still passes.
+func (fs *FileSync) shouldProcess(event fsnotify.Event) bool {
+	if fs.isTemporaryFile(event.Name) {
+		return false
+	}
+	return event.Op != fsnotify.Chmod
+}
+
 // processEvents processes filesystem events
 func (fs *FileSync) processEvents() {
 	debounce := make(map[string]*time.Timer)
@@ -266,18 +278,7 @@ func (fs *FileSync) processEvents() {
 				return
 			}
 
-			// Skip temporary files
-			if fs.isTemporaryFile(event.Name) {
-				continue
-			}
-
-			// Pure CHMOD carries no create/write/remove semantics. Because every
-			// event resets the debounce timer and only the last one is processed,
-			// a trailing CHMOD (emitted by mv/cp and by CMS move+chmod uploads)
-			// would otherwise collapse the debounced event into a no-op and the
-			// file would never be uploaded. Skip standalone CHMOD events; a
-			// combined WRITE|CHMOD still passes through.
-			if event.Op == fsnotify.Chmod {
+			if !fs.shouldProcess(event) {
 				continue
 			}
 
