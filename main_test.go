@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -128,5 +132,155 @@ func TestShouldProcess(t *testing.T) {
 		if got := fs.shouldProcess(c.event); got != c.want {
 			t.Errorf("%s: shouldProcess = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// runEventLoop starts processEvents on a fake watcher and returns its event channel.
+func runEventLoop(t *testing.T, delay time.Duration, handle func(fsnotify.Event, bool)) chan<- fsnotify.Event {
+	t.Helper()
+	events := make(chan fsnotify.Event)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	fs := &FileSync{
+		config:        &Config{},
+		watcher:       &fsnotify.Watcher{Events: events, Errors: make(chan error)},
+		ctx:           ctx,
+		cancel:        cancel,
+		debounceDelay: delay,
+		handler:       handle,
+	}
+	go fs.processEvents()
+	return events
+}
+
+// Timers fire while the loop keeps arming new ones. Without the lock -race reports the
+// debounce maps; in production that is a fatal concurrent map write.
+func TestProcessEventsConcurrentTimers(t *testing.T) {
+	var mu sync.Mutex
+	handled := map[string]int{}
+	events := runEventLoop(t, time.Millisecond, func(e fsnotify.Event, _ bool) {
+		mu.Lock()
+		handled[e.Name]++
+		mu.Unlock()
+	})
+
+	const files = 40
+	for round := 0; round < 25; round++ {
+		for i := 0; i < files; i++ {
+			events <- fsnotify.Event{Name: fmt.Sprintf("/w/f%d.jpg", i), Op: fsnotify.Write}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(handled) != files {
+		t.Fatalf("handled %d distinct files, want %d", len(handled), files)
+	}
+}
+
+// A burst on one path inside the debounce window is handled once, as its last event.
+func TestProcessEventsDebounceBurst(t *testing.T) {
+	got := make(chan fsnotify.Event, 4)
+	events := runEventLoop(t, 50*time.Millisecond, func(e fsnotify.Event, _ bool) { got <- e })
+
+	events <- fsnotify.Event{Name: "/w/a.jpg", Op: fsnotify.Create}
+	events <- fsnotify.Event{Name: "/w/a.jpg", Op: fsnotify.Write}
+	events <- fsnotify.Event{Name: "/w/a.jpg", Op: fsnotify.Write}
+
+	select {
+	case e := <-got:
+		if e.Op != fsnotify.Write {
+			t.Errorf("handled %s, want the last event (WRITE)", e.Op)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the burst was never handled")
+	}
+	select {
+	case e := <-got:
+		t.Fatalf("the burst was handled twice; second event %s", e.Op)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// Handlers append while the batcher drains: every path is delivered exactly once.
+func TestInvalidationBatchConcurrent(t *testing.T) {
+	fs := &FileSync{config: &Config{CloudFrontEnabled: true}, invalidationBatch: &InvalidationBatch{}}
+
+	const writers, perWriter = 8, 200
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				fs.addToInvalidationBatch(fmt.Sprintf("/uploads/w%d/f%d.jpg", w, i))
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	seen := map[string]int{}
+	drain := func() {
+		for _, p := range fs.takeInvalidationBatch() {
+			seen[p]++
+		}
+	}
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+			drain()
+		}
+	}
+	drain()
+
+	if len(seen) != writers*perWriter {
+		t.Fatalf("delivered %d distinct paths, want %d", len(seen), writers*perWriter)
+	}
+	for p, n := range seen {
+		if n != 1 {
+			t.Fatalf("%s delivered %d times", p, n)
+		}
+	}
+}
+
+func TestRetryQueueConcurrentAppend(t *testing.T) {
+	fs := &FileSync{config: &Config{RetryFile: filepath.Join(t.TempDir(), "retry.json")}}
+
+	const n = 200
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fs.addToRetryQueue("delete", fmt.Sprintf("/w/%d", i), fmt.Sprintf("uploads/%d", i))
+		}()
+	}
+	wg.Wait()
+
+	if got := len(fs.retryQueue); got != n {
+		t.Fatalf("retry queue holds %d entries, want %d", got, n)
+	}
+}
+
+// Entries a handler appends while a retry pass runs survive the end of that pass.
+func TestRetryPassKeepsEntriesAddedDuringIt(t *testing.T) {
+	fs := &FileSync{config: &Config{RetryFile: filepath.Join(t.TempDir(), "retry.json")}}
+	fs.addToRetryQueue("delete", "/w/a", "uploads/a")
+	fs.addToRetryQueue("delete", "/w/b", "uploads/b")
+
+	queue, taken := fs.snapshotRetryQueue()
+	fs.addToRetryQueue("delete", "/w/c", "uploads/c") // arrives mid-pass
+
+	still := []RetryOperation{queue[1]} // a succeeded, b failed again
+	if n := fs.finishRetryPass(still, taken); n != 2 {
+		t.Fatalf("queue length %d after the pass, want 2", n)
+	}
+	if fs.retryQueue[0].S3Key != "uploads/b" || fs.retryQueue[1].S3Key != "uploads/c" {
+		t.Fatalf("queue = %+v, want [b c]", fs.retryQueue)
 	}
 }

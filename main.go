@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -67,6 +68,13 @@ type FileSync struct {
 	recentlyCreated   map[string]time.Time // Track recently created files
 	ctx               context.Context
 	cancel            context.CancelFunc
+
+	// Handlers run on debounce-timer goroutines, concurrently with the batcher and the retry loop.
+	batchMu sync.Mutex // guards invalidationBatch
+	retryMu sync.Mutex // guards retryQueue and the retry file
+
+	debounceDelay time.Duration                              // zero means one second
+	handler       func(event fsnotify.Event, isNewFile bool) // nil means handleFileEventWithCheck
 }
 
 // NewFileSync creates a new FileSync instance
@@ -190,11 +198,13 @@ func (fs *FileSync) Stop() {
 	fs.watcher.Close()
 
 	// Process any remaining invalidations
-	if fs.config.CloudFrontEnabled && len(fs.invalidationBatch.paths) > 0 {
+	if fs.config.CloudFrontEnabled {
 		fs.processInvalidationBatch()
 	}
 
+	fs.retryMu.Lock()
 	fs.saveRetryQueue()
+	fs.retryMu.Unlock()
 	log.Printf("Service stopped")
 }
 
@@ -266,6 +276,17 @@ func (fs *FileSync) shouldProcess(event fsnotify.Event) bool {
 
 // processEvents processes filesystem events
 func (fs *FileSync) processEvents() {
+	delay := fs.debounceDelay
+	if delay == 0 {
+		delay = time.Second
+	}
+	handle := fs.handler
+	if handle == nil {
+		handle = fs.handleFileEventWithCheck
+	}
+
+	// Timer callbacks run on their own goroutines; mu guards both maps.
+	var mu sync.Mutex
 	debounce := make(map[string]*time.Timer)
 	newFiles := make(map[string]bool) // Track truly new files
 
@@ -285,13 +306,18 @@ func (fs *FileSync) processEvents() {
 			log.Printf("File event: %s %s", event.Op, event.Name)
 
 			// Track new files on CREATE
+			created := false
 			if event.Op&fsnotify.Create == fsnotify.Create {
 				if fileInfo, err := os.Stat(event.Name); err == nil && !fileInfo.IsDir() {
-					newFiles[event.Name] = true
+					created = true
 					log.Printf("Marking as new file: %s", event.Name)
 				}
 			}
 
+			mu.Lock()
+			if created {
+				newFiles[event.Name] = true
+			}
 			// Clean up tracking for removed files
 			if event.Op&fsnotify.Remove == fsnotify.Remove {
 				delete(newFiles, event.Name)
@@ -302,11 +328,24 @@ func (fs *FileSync) processEvents() {
 				timer.Stop()
 			}
 
-			debounce[event.Name] = time.AfterFunc(1*time.Second, func() { // Increased to 1 second
-				fs.handleFileEventWithCheck(event, newFiles[event.Name])
+			var timer *time.Timer
+			timer = time.AfterFunc(delay, func() {
+				mu.Lock()
+				// Stop lost the race with this callback and a newer event re-armed the path;
+				// the newer timer handles it.
+				if debounce[event.Name] != timer {
+					mu.Unlock()
+					return
+				}
+				isNewFile := newFiles[event.Name]
 				delete(debounce, event.Name)
-				delete(newFiles, event.Name) // Clean up after processing
+				delete(newFiles, event.Name)
+				mu.Unlock()
+
+				handle(event, isNewFile)
 			})
+			debounce[event.Name] = timer
+			mu.Unlock()
 
 		case err, ok := <-fs.watcher.Errors:
 			if !ok {
@@ -695,8 +734,23 @@ func (fs *FileSync) addToInvalidationBatch(path string) {
 	// Properly encode the path for CloudFront
 	encodedPath := fs.encodePathForCloudFront(path)
 
+	fs.batchMu.Lock()
 	fs.invalidationBatch.paths = append(fs.invalidationBatch.paths, encodedPath)
+	fs.batchMu.Unlock()
 	log.Printf("Added to invalidation batch: %s (encoded: %s)", path, encodedPath)
+}
+
+// takeInvalidationBatch empties the batch and returns what it held.
+func (fs *FileSync) takeInvalidationBatch() []string {
+	fs.batchMu.Lock()
+	defer fs.batchMu.Unlock()
+	if len(fs.invalidationBatch.paths) == 0 {
+		return nil
+	}
+	paths := fs.invalidationBatch.paths
+	fs.invalidationBatch.paths = make([]string, 0, len(paths))
+	fs.invalidationBatch.timestamp = time.Now()
+	return paths
 }
 
 // invalidationBatchProcessor processes invalidation batches based on configured interval
@@ -713,25 +767,17 @@ func (fs *FileSync) invalidationBatchProcessor() {
 		case <-fs.ctx.Done():
 			return
 		case <-ticker.C:
-			if len(fs.invalidationBatch.paths) > 0 {
-				fs.processInvalidationBatch()
-			}
+			fs.processInvalidationBatch()
 		}
 	}
 }
 
 // processInvalidationBatch creates a CloudFront invalidation for batched paths
 func (fs *FileSync) processInvalidationBatch() {
-	if len(fs.invalidationBatch.paths) == 0 {
+	rawPaths := fs.takeInvalidationBatch()
+	if len(rawPaths) == 0 {
 		return
 	}
-
-	rawPaths := make([]string, len(fs.invalidationBatch.paths))
-	copy(rawPaths, fs.invalidationBatch.paths)
-
-	// Clear the batch
-	fs.invalidationBatch.paths = fs.invalidationBatch.paths[:0]
-	fs.invalidationBatch.timestamp = time.Now()
 
 	// Optimize paths by using wildcards where appropriate
 	optimizedPaths := fs.optimizeInvalidationPaths(rawPaths)
@@ -924,8 +970,27 @@ func (fs *FileSync) addToRetryQueue(opType, filePath, s3Key string) {
 		AttemptCount: 1,
 	}
 
+	fs.retryMu.Lock()
+	defer fs.retryMu.Unlock()
 	fs.retryQueue = append(fs.retryQueue, operation)
 	fs.saveRetryQueue()
+}
+
+// snapshotRetryQueue returns a copy of the queue and its length at the start of a pass.
+func (fs *FileSync) snapshotRetryQueue() ([]RetryOperation, int) {
+	fs.retryMu.Lock()
+	defer fs.retryMu.Unlock()
+	return append([]RetryOperation(nil), fs.retryQueue...), len(fs.retryQueue)
+}
+
+// finishRetryPass replaces the first taken entries with what is still pending; entries
+// appended by handlers during the pass are kept after them. It returns the new length.
+func (fs *FileSync) finishRetryPass(remaining []RetryOperation, taken int) int {
+	fs.retryMu.Lock()
+	defer fs.retryMu.Unlock()
+	fs.retryQueue = append(remaining, fs.retryQueue[taken:]...)
+	fs.saveRetryQueue()
+	return len(fs.retryQueue)
 }
 
 // retryLoop periodically processes the retry queue
@@ -945,15 +1010,16 @@ func (fs *FileSync) retryLoop() {
 
 // processRetryQueue processes all items in the retry queue
 func (fs *FileSync) processRetryQueue() {
-	if len(fs.retryQueue) == 0 {
+	queue, taken := fs.snapshotRetryQueue()
+	if taken == 0 {
 		return
 	}
 
-	log.Printf("Processing retry queue with %d items", len(fs.retryQueue))
+	log.Printf("Processing retry queue with %d items", taken)
 
 	var remaining []RetryOperation
 
-	for _, operation := range fs.retryQueue {
+	for _, operation := range queue {
 		// Check if max attempts reached
 		if operation.AttemptCount > fs.config.MaxRetryAttempts {
 			log.Printf("Max retry attempts (%d) exceeded for operation %s on %s, removing from queue",
@@ -1026,12 +1092,8 @@ func (fs *FileSync) processRetryQueue() {
 		}
 	}
 
-	// Update retry queue with remaining operations
-	fs.retryQueue = remaining
-	fs.saveRetryQueue()
-
-	if len(remaining) > 0 {
-		log.Printf("Retry queue now contains %d items", len(remaining))
+	if n := fs.finishRetryPass(remaining, taken); n > 0 {
+		log.Printf("Retry queue now contains %d items", n)
 	} else {
 		log.Printf("Retry queue is now empty")
 	}
@@ -1051,7 +1113,7 @@ func (fs *FileSync) loadRetryQueue() error {
 	return json.Unmarshal(data, &fs.retryQueue)
 }
 
-// saveRetryQueue saves the retry queue to file
+// saveRetryQueue saves the retry queue to file. The caller holds retryMu.
 func (fs *FileSync) saveRetryQueue() error {
 	if len(fs.retryQueue) == 0 {
 		// Remove retry file if queue is empty
